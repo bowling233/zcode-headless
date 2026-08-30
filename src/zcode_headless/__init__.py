@@ -952,13 +952,13 @@ def do_update(force=False):
         return
     log(f"发现新版本 {cur_ver} -> {new_ver}")
     log(f"  {entry['url']}")
+    APPS_DIR.mkdir(parents=True, exist_ok=True)  # 引导安装时目录尚不存在
     tmp = download(entry["url"], APPS_DIR / f"ZCode-{new_ver}-linux-x64.AppImage",
                    entry.get("sha512"), entry.get("size"))
     was_running = bool(find_running())
     if was_running:
         log("停止当前实例 …")
         do_stop(quiet=True)
-    APPS_DIR.mkdir(parents=True, exist_ok=True)
     tmp.chmod(0o755)
     final = APPS_DIR / f"ZCode-{new_ver}-linux-x64.AppImage"
     tmp.replace(final)
