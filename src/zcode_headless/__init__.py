@@ -786,13 +786,17 @@ def do_start(rotate=False, relogin=False):
         die(f"未找到 AppImage（期望 {APPS_DIR}/ZCode-*-linux-x64.AppImage；"
             f"可先执行 `zcode update` 从官方 manifest 安装）")
     ver = app_version_from_path(appimage)
-    # restore 要求开机工作区与远控 context 一致，故用应用原生参数显式打开该工作区
+    # 以当前目录为远控工作区（WebUI 无法新建工作区，靠启动参数指定）；
+    # relay restore 要求开机工作区与远控 context 一致，故先回写 setting.json 再 --open-workspace
     app_args = ["--no-sandbox", "--disable-gpu"]
-    ws = ((read_json(V2_DIR / "setting.json").get("webRemoteControlLastEnabledContext") or {})
-          .get("workspacePath") or "")
-    if ws and os.path.isdir(ws):
-        app_args += ["--open-workspace", ws]
-        log(f"将打开远控工作区: {ws}")
+    ws = os.getcwd()
+    setting_path = V2_DIR / "setting.json"
+    cur_ws = ((read_json(setting_path).get("webRemoteControlLastEnabledContext") or {})
+              .get("workspacePath") or "")
+    if ws != cur_ws:
+        _merge_json(setting_path, {"webRemoteControlLastEnabledContext": {"workspacePath": ws}})
+    app_args += ["--open-workspace", ws]
+    log(f"远控工作区: {ws}")
     pid, display = start_app(appimage, app_args)
     log(f"ZCode {ver or ''} 启动中 (pid {pid}, {display}, 日志: {APP_LOG}) …")
     state = wait_relay_ready(pid)

@@ -1,6 +1,6 @@
 [project]
 name = "zcode-headless"
-version = "0.1.1"
+version = "0.1.2"
 description = "Headless 服务器上的 ZCode 管理工具：登录 / 远控注册 / 启动 / 更新，一条命令到底"
 readme = "README.md"
 requires-python = ">=3.10"
