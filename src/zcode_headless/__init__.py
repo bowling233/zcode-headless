@@ -53,6 +53,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -85,12 +86,17 @@ V2_DIR = ZCODE_DIR / "v2"
 CTL_DIR = ZCODE_DIR / "headless"
 STATE_FILE = CTL_DIR / "state.json"
 APP_LOG = CTL_DIR / "app.log"
+APPIMAGE_TMP_DIR = CTL_DIR / "tmp"
 APPS_DIR = Path.home() / "Applications"
-APPIMAGE_RE = re.compile(r"ZCode-([\d.]+)-linux-x\d+\.AppImage$")
+APPIMAGE_RE = re.compile(r"ZCode-([\d.]+)-linux-(?:x\d+|arm64|aarch64)\.AppImage$")
 # extract-and-run 模式下真正的 Electron 进程在 /tmp/appimage_extracted_*/ 里，
 # cmdline 不含 AppImage 路径，必须单独匹配
-RUNNING_RE = re.compile(r"(ZCode-[\d.]+-linux-x\d+\.AppImage|/\.mount_ZCode-|/appimage_extracted_[0-9a-z]+/)")
+RUNNING_RE = re.compile(
+    r"(ZCode-[\d.]+-linux-(?:x\d+|arm64|aarch64)\.AppImage|/\.mount_ZCode-|/appimage_extracted_[0-9a-z]+/)"
+)
 READY_TIMEOUT = 240  # extract-and-run 冷启动解压较慢（200MB），慢盘上可达 2 分钟以上
+RELAY_READY_STATES = {"waiting_terminal", "paired"}
+WEB_REMOTE_V4_MIN_VERSION = (3, 4, 0)
 
 
 def log(msg, file=None):
@@ -106,10 +112,14 @@ def die(msg, code=1):
 
 def _proc_uid(pid_dir):
     try:
-        m = re.search(r"^Uid:\s*(\d+)", (pid_dir / "status").read_text(), re.M)
+        m = re.search(r"^Uid:\s*(\d+)", (pid_dir / "status").read_text(), re.MULTILINE)
     except OSError:
         return None
     return int(m.group(1)) if m else None
+
+
+def is_zcode_executable(token):
+    return bool(RUNNING_RE.search(token))
 
 
 def find_running():
@@ -128,13 +138,15 @@ def find_running():
             cmdline = (pid_dir / "cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
-        for token in cmdline:
-            token = token.decode("utf-8", "replace")
-            if RUNNING_RE.search(token):
-                m = APPIMAGE_RE.search(token)
-                ver = m.group(1) if m else None
-                out.append((int(pid_dir.name), ver, token))
-                break
+        # 只能检查可执行文件（argv[0]）。扫描全部参数会把 grep、校验脚本等仅仅
+        # 引用了 AppImage 路径的进程误判成 ZCode。
+        if not cmdline:
+            continue
+        token = cmdline[0].decode("utf-8", "replace")
+        if is_zcode_executable(token):
+            m = APPIMAGE_RE.search(token)
+            ver = m.group(1) if m else None
+            out.append((int(pid_dir.name), ver, token))
     return sorted(out)
 
 
@@ -143,11 +155,20 @@ def app_version_from_path(path):
     return m.group(1) if m else None
 
 
+def app_version_from_running(running):
+    """优先取进程命令行中的版本，extract-and-run 子进程则回退到启动状态/AppImage。"""
+    version = next((ver for _, ver, _ in running if ver), None)
+    if version:
+        return version
+    state_appimage = read_json(STATE_FILE).get("appimage")
+    return app_version_from_path(state_appimage) or app_version_from_path(find_appimage())
+
+
 # ---------- AppImage 定位 ----------
 
 def find_appimage():
-    """取 ~/Applications 下 mtime 最新的 AppImage；没有则返回 None。"""
-    cands = sorted(APPS_DIR.glob("ZCode-*-linux-x*.AppImage"),
+    """取 ~/Applications 下当前 CPU 架构、mtime 最新的 AppImage；没有则返回 None。"""
+    cands = sorted(APPS_DIR.glob(f"ZCode-*-{release_platform()}.AppImage"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
     return cands[0] if cands else None
 
@@ -155,7 +176,10 @@ def find_appimage():
 # ---------- 凭据加解密（官方 enc:v1 格式） ----------
 
 def credential_secret():
-    # 与官方客户端 defaultCredentialSecret 对齐: os.platform():os.homedir():os.userInfo().username
+    # 与官方客户端 defaultCredentialSecret 对齐：显式 secret 优先，否则使用平台/家目录/用户名。
+    configured = os.environ.get("ZCODE_CREDENTIAL_SECRET")
+    if configured:
+        return configured
     return f"zcode-credential-fallback:linux:{Path.home()}:{pwd.getpwuid(os.getuid()).pw_name}"
 
 
@@ -219,12 +243,24 @@ def last_relay_state():
     return states[-1] if states else None
 
 
+def web_remote_path(app_version):
+    """与官方 isWebRemoteControlV4AppVersion 对齐：3.4.0 起使用 /remote/v4。"""
+    match = re.fullmatch(
+        r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?",
+        str(app_version or "").strip())
+    if not match:
+        return "/remote/v3"
+    version = tuple(int(match.group(i)) for i in range(1, 4))
+    return "/remote/v4" if (version > WEB_REMOTE_V4_MIN_VERSION or (
+        version == WEB_REMOTE_V4_MIN_VERSION and match.group(4) is None)) else "/remote/v3"
+
+
 def build_link(app_version=None, warn=True):
     """从持久化文件重建远控链接。返回 (url|None, problem|None)。"""
     setting = read_json(V2_DIR / "setting.json")
     sid = ((setting.get("webRemoteControlExternalRelayDevice") or {}).get("deviceSid") or "").strip()
     if not sid:
-        return None, "远控从未开启（setting.json 无 deviceSid）——先执行 `zcode enable` 注册（无需 GUI）"
+        return None, "远控从未开启（setting.json 无 deviceSid）——执行 `zcode --rotate` 注册（无需 GUI）"
     pass_hash, err = decrypt_pass_hash()
     if not pass_hash:
         return None, err
@@ -239,7 +275,8 @@ def build_link(app_version=None, warn=True):
         qs["mid"] = mid
     if app_version:
         qs["app_version"] = app_version
-    url = f"{ENDPOINT}/remote/v4?" + urllib.parse.urlencode(qs, quote_via=urllib.parse.quote)
+    url = f"{ENDPOINT}{web_remote_path(app_version)}?" + urllib.parse.urlencode(
+        qs, quote_via=urllib.parse.quote)
     return url, None
 
 
@@ -522,15 +559,18 @@ def relay_ws_url():
 class RelayWS:
     """标准库实现的 WebSocket 客户端，只覆盖文本帧收发与 ping/pong。"""
 
-    def __init__(self, timeout=15):
+    def __init__(self, device_mid=None, timeout=15):
         self.host, self.port, self.path = relay_ws_url()
+        if device_mid:
+            self.path += "?" + urllib.parse.urlencode({"mid": device_mid})
         raw = socket.create_connection((self.host, self.port), timeout=timeout)
         ctx = ssl.create_default_context()
         self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
         key = base64.b64encode(os.urandom(16)).decode()
         req = (f"GET {self.path} HTTP/1.1\r\nHost: {self.host}\r\n"
                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+               f"X-Device-ID: {device_mid or ''}\r\n\r\n")
         self.sock.sendall(req.encode())
         resp = b""
         while b"\r\n\r\n" not in resp:
@@ -541,6 +581,16 @@ class RelayWS:
         head, self.buf = resp.split(b"\r\n\r\n", 1)
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             die(f"relay WS 握手失败: {head.split(chr(13).encode())[0].decode(errors='replace')}")
+        expected_accept = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        headers = {}
+        for line in head.split(b"\r\n")[1:]:
+            name, sep, value = line.partition(b":")
+            if sep:
+                headers[name.strip().lower()] = value.strip().decode("ascii", "replace")
+        if headers.get(b"sec-websocket-accept") != expected_accept:
+            self.sock.close()
+            raise ConnectionError("relay WS Sec-WebSocket-Accept 校验失败")
 
     def _recv(self, n):
         while len(self.buf) < n:
@@ -611,9 +661,9 @@ def hmac_sha256_b64url(key, message):
         _hmac.new(key.encode(), message.encode(), hashlib.sha256).digest()).decode().rstrip("=")
 
 
-def relay_exchange(first_msg, proof_key, meta):
+def relay_exchange(first_msg, proof_key, meta, device_mid=None):
     """发送首条消息并完成 注册/持久认证 + 挑战应答 流程。返回 (sid, pair_status)。"""
-    ws = RelayWS()
+    ws = RelayWS(device_mid=device_mid)
     try:
         ws.send_json(first_msg)
         sid, pair = None, None
@@ -652,22 +702,31 @@ def encrypt_secret(plain):
 def _merge_json(path, patch):
     data = read_json(path)
     data.update(patch)
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    tmp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+                delete=False) as fp:
+            tmp = Path(fp.name)
+            os.chmod(tmp, 0o600)
+            json.dump(data, fp, indent=2, ensure_ascii=False)
+            fp.flush()
+            os.fsync(fp.fileno())
+        tmp.replace(path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def relay_registered():
-    """setting.json 有 deviceSid 且 credentials.json 有远控 pass_hash 即视为已注册。"""
+    """deviceSid 存在且远控 pass_hash 可按当前官方 secret 解密才视为已注册。"""
     sid = ((read_json(V2_DIR / "setting.json").get("webRemoteControlExternalRelayDevice") or {})
            .get("deviceSid") or "").strip()
     if not sid:
         return False
-    try:
-        creds = json.loads((V2_DIR / "credentials.json").read_text())
-    except (OSError, ValueError):
-        return False
-    return bool(creds.get("web-remote-control:external-relay:pass_hash"))
+    pass_hash, _ = decrypt_pass_hash()
+    return bool(pass_hash)
 
 
 def do_enable():
@@ -688,7 +747,7 @@ def do_enable():
         sid, pair = relay_exchange(
             {"type": "device_register_init", "device_mid": device_mid,
              "pass_hash": pass_hash, "meta": meta, "client_ts": int(time.time() * 1000)},
-            proof_key=pass_hash, meta=meta)
+            proof_key=pass_hash, meta=meta, device_mid=device_mid)
     except OSError as e:
         die(f"无法连接 relay ({ENDPOINT}): {e}")
     if not sid or pair != "waiting":
@@ -702,15 +761,19 @@ def do_enable():
         "webRemoteControlLastEnabledContext": {"workspacePath": os.getcwd()},
     })
     creds_path = V2_DIR / "credentials.json"
-    _merge_json(creds_path, {"web-remote-control:external-relay:pass_hash": encrypt_secret(password)})
+    # 官方客户端持久化的是 createPassHash(password) 的结果，而不是 password。
+    # 保存 preimage 会迫使应用首次连接走 AUTH_FAILED -> 清理 -> 重注册的自愈路径。
+    _merge_json(creds_path, {"web-remote-control:external-relay:pass_hash": encrypt_secret(pass_hash)})
     for p in (setting_path, creds_path):
         os.chmod(p, 0o600)
     log(f"✓ 远控已注册，凭据已写入 setting.json / credentials.json（workspace: {os.getcwd()}）")
 
 
 def start_app(appimage, app_args):
-    """后台启动 ZCode，等待 relay 就绪。返回 (pid, display_desc)。"""
+    """后台启动 ZCode。返回 (Popen, display_desc, relay 日志启动位置)。"""
     CTL_DIR.mkdir(parents=True, exist_ok=True)
+    APPIMAGE_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(APPIMAGE_TMP_DIR, 0o700)
     xvfb_run = shutil.which("xvfb-run")
     if xvfb_run and not os.environ.get("ZCODE_USE_SESSION_DISPLAY"):
         prefix = [xvfb_run, "-a", "--server-args=-screen 0 1440x900x24 -nolisten tcp"]
@@ -722,51 +785,73 @@ def start_app(appimage, app_args):
         die("无可用显示: 未找到 xvfb-run 且本会话无 DISPLAY/WAYLAND_DISPLAY。\n"
             "  headless 主机请先安装 Xvfb（Fedora: sudo dnf install xorg-x11-server-Xvfb；Debian: sudo apt install xvfb）")
 
-    env = {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}
+    # AppImage extract-and-run 默认使用 /tmp 下的内容哈希目录。若同一 AppImage 曾被
+    # 其他用户（尤其 root）启动，0700 的同名残留目录会让本用户稳定 Permission denied。
+    env = {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1", "TMPDIR": str(APPIMAGE_TMP_DIR)}
+    relay_checkpoint = relay_log_checkpoint()
     log_file = APP_LOG.open("w")
     proc = subprocess.Popen(
         [*prefix, str(appimage), *app_args],
         stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
         start_new_session=True, env=env)
     log_file.close()
-    STATE_FILE.write_text(json.dumps({"pid": proc.pid, "started_at": time.time(),
-                                      "appimage": str(appimage), "display": display_desc}))
-    return proc.pid, display_desc
+    _merge_json(STATE_FILE, {"pid": proc.pid, "started_at": time.time(),
+                             "appimage": str(appimage), "display": display_desc})
+    return proc, display_desc, relay_checkpoint
 
 
-def wait_relay_ready(pid, deadline=None):
-    """等待官方日志出现 relay waiting_terminal（已连接等待配对）。返回最后观测状态。"""
+def relay_log_checkpoint():
+    """记录启动前官方 relay 日志位置，避免错过应用快速写出的 ready 状态。"""
+    path = V2_DIR / "logs" / time.strftime("%Y-%m-%d.log", time.localtime())
+    try:
+        return {path: path.stat().st_size}
+    except OSError:
+        return {path: 0}
+
+
+def wait_relay_ready(proc, checkpoint=None, deadline=None):
+    """等待官方日志出现 relay waiting_terminal/paired，并及时识别子进程退出。"""
     deadline = deadline or time.time() + READY_TIMEOUT
     today = lambda: V2_DIR / "logs" / time.strftime("%Y-%m-%d.log", time.localtime())
-    seen_size = 0
-    if today().exists():
-        seen_size = today().stat().st_size  # 只看启动之后的新日志
+    seen_sizes = dict(checkpoint or relay_log_checkpoint())
     while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if proc.poll() is not None:
             return "process-exited"
         f = today()
         if f.exists():
             size = f.stat().st_size
+            seen_size = seen_sizes.get(f, 0)
             if size < seen_size:  # 跨天滚动
                 seen_size = 0
             if size > seen_size:
                 with f.open(errors="replace") as fp:
                     fp.seek(seen_size)
                     new_text = fp.read()
-                seen_size = size
+                seen_sizes[f] = size
                 states = re.findall(r'external relay device state \{"state":"([a-z_]+)"\}', new_text)
-                if states and states[-1] == "waiting_terminal":
+                if states and states[-1] in RELAY_READY_STATES:
                     return states[-1]
+                if "[web-remote-control] restore previous enabled state failed" in new_text:
+                    return "relay-error"
         time.sleep(1)
     return last_relay_state() or "timeout"
 
 
 def do_start(rotate=False, relogin=False):
     running = find_running()
+    if running and (rotate or relogin):
+        requested = "、".join(name for enabled, name in (
+            (rotate, "远控重新注册"), (relogin, "重新登录")) if enabled)
+        log(f"ZCode 正在运行；为执行{requested}先停止当前实例 …")
+        do_stop(quiet=True)
+        running = []
+    if running and not relay_registered():
+        log("ZCode 正在运行，但远控凭据缺失或无法解密；停止实例后重新注册 …")
+        do_stop(quiet=True)
+        running = []
     if running:
-        pid, ver, _ = running[0]
+        pid, _, _ = running[0]
+        ver = app_version_from_running(running)
         log(f"ZCode 已在运行 (pid {pid}, v{ver or '?'})")
         print_link(ver)
         return
@@ -783,7 +868,7 @@ def do_start(rotate=False, relogin=False):
     # 3) 启动应用
     appimage = find_appimage()
     if not appimage:
-        die(f"未找到 AppImage（期望 {APPS_DIR}/ZCode-*-linux-x64.AppImage；"
+        die(f"未找到 AppImage（期望 {APPS_DIR}/ZCode-*-{release_platform()}.AppImage；"
             f"可先执行 `zcode update` 从官方 manifest 安装）")
     ver = app_version_from_path(appimage)
     # 以当前目录为远控工作区（WebUI 无法新建工作区，靠启动参数指定）；
@@ -797,16 +882,18 @@ def do_start(rotate=False, relogin=False):
         _merge_json(setting_path, {"webRemoteControlLastEnabledContext": {"workspacePath": ws}})
     app_args += ["--open-workspace", ws]
     log(f"远控工作区: {ws}")
-    pid, display = start_app(appimage, app_args)
-    log(f"ZCode {ver or ''} 启动中 (pid {pid}, {display}, 日志: {APP_LOG}) …")
-    state = wait_relay_ready(pid)
+    proc, display, relay_checkpoint = start_app(appimage, app_args)
+    log(f"ZCode {ver or ''} 启动中 (pid {proc.pid}, {display}, 日志: {APP_LOG}) …")
+    state = wait_relay_ready(proc, relay_checkpoint)
     if state == "process-exited":
         tail = ""
         if APP_LOG.exists():
             tail = "\n".join(APP_LOG.read_text(errors="replace").splitlines()[-10:])
         die(f"进程退出。{APP_LOG} 末尾:\n{tail}")
-    if state == "waiting_terminal":
+    if state in RELAY_READY_STATES:
         log(f"✓ ZCode v{ver} 已就绪，relay 已连接")
+    elif state == "relay-error":
+        log("⚠ ZCode 已启动，但官方日志报告 relay 自动恢复失败；可执行 `zcode --rotate` 重试。")
     else:
         log(f"⚠ 已启动，但 {READY_TIMEOUT}s 内未确认 relay 连接（最近状态: {state}）。")
     print_link(ver)
@@ -833,7 +920,7 @@ def _descendants(pids):
         if not d.name.isdigit():
             continue
         try:
-            m = re.search(r"^PPid:\s*(\d+)$", (d / "status").read_text(), re.M)
+            m = re.search(r"^PPid:\s*(\d+)$", (d / "status").read_text(), re.MULTILINE)
         except OSError:
             continue
         if m:
@@ -957,16 +1044,16 @@ def do_update(force=False):
     log(f"发现新版本 {cur_ver} -> {new_ver}")
     log(f"  {entry['url']}")
     APPS_DIR.mkdir(parents=True, exist_ok=True)  # 引导安装时目录尚不存在
-    tmp = download(entry["url"], APPS_DIR / f"ZCode-{new_ver}-linux-x64.AppImage",
+    final = APPS_DIR / f"ZCode-{new_ver}-{platform}.AppImage"
+    tmp = download(entry["url"], final,
                    entry.get("sha512"), entry.get("size"))
     was_running = bool(find_running())
     if was_running:
         log("停止当前实例 …")
         do_stop(quiet=True)
     tmp.chmod(0o755)
-    final = APPS_DIR / f"ZCode-{new_ver}-linux-x64.AppImage"
     tmp.replace(final)
-    for old in APPS_DIR.glob("ZCode-*-linux-x*.AppImage"):
+    for old in APPS_DIR.glob("ZCode-*-linux-*.AppImage"):
         if old != final:
             old.unlink()
             log(f"  已移除旧版 {old.name}")
@@ -974,7 +1061,7 @@ def do_update(force=False):
     if was_running:
         do_start()
     else:
-        log(f"执行 `zcode` 可启动并获取远控链接")
+        log("执行 `zcode` 可启动并获取远控链接")
 
 
 def main():

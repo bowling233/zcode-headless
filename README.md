@@ -16,6 +16,8 @@ uv tool install git+ssh://git@github.com/bowling233/zcode-headless.git
 
 依赖 `uv`（工具环境自动隔离安装 cryptography/pyyaml）；headless 显示依赖 Xvfb
 （Debian: `apt install xvfb`，Fedora: `dnf install xorg-x11-server-Xvfb`）。
+AppImage 解压目录固定隔离在 `~/.zcode/headless/tmp/`，不会与其他用户或 root 在
+`/tmp/appimage_extracted_*` 下的同名目录冲突。
 
 ## 命令
 
@@ -44,8 +46,11 @@ zcode update       更新最新版（官方 manifest，sha512 校验；--force �
   `sid` ← `setting.json:webRemoteControlExternalRelayDevice.deviceSid`；
   `hash` ← `credentials.json` key `web-remote-control:external-relay:pass_hash`
   （`enc:v1` = AES-256-GCM，key = sha256(`zcode-credential-fallback:linux:$HOME:$USER`)，
-  格式 `enc:v1:nonce_b64url.tag_b64url.ct_b64url`）；`mid` ←
+  设置 `ZCODE_CREDENTIAL_SECRET` 时与官方一样优先使用该值；格式
+  `enc:v1:nonce_b64url.tag_b64url.ct_b64url`）；`mid` ←
   `telemetry-state.json:deviceMid`；`t` = 现生成毫秒时间戳。
+- `hash` 的明文值是 `base64(sha256(randomPassword))`，不是随机密码本身；注册、
+  HMAC proof、凭据持久化和远控链接统一使用这个 pass hash，与 3.14.3 官方包一致。
 - relay 是设备级信任（只认 pass_hash），注册无需账号 token。握手：
   `device_register_init{device_mid,pass_hash,meta}` → `device_register_ack{device_sid}`
   → `auth_init{role:"device"}` → `auth_challenge{nonce}` →
@@ -57,8 +62,21 @@ zcode update       更新最新版（官方 manifest，sha512 校验；--force �
 - 应用启动的 relay 自动恢复（`restorePreviouslyEnabled`）要求开机工作区与
   `webRemoteControlLastEnabledContext.workspacePath` 一致，否则静默跳过 →
   `start` 会带 `--open-workspace <path>`（应用原生参数）打开同一工作区。
-- 更新通道：`GET {ENDPOINT}/api/v1/releases/electron/manifest?platform=linux-x64&channel=latest`
+- 更新通道：`GET {ENDPOINT}/api/v1/releases/electron/manifest?platform=linux-{arch}&channel=latest`
   （YAML：version + files[].url/sha512/size，AppImage 直链）。
+- 远控页面版本与官方门槛一致：ZCode 3.4.0 stable 起使用 `/remote/v4`，更早版本
+  使用 `/remote/v3`。
+
+## 与开源版 ZCode 的关系
+
+ZCode 的公开源码没有包含 external relay 的完整实现，但发行版 AppImage 的
+`resources/app.asar/out/main/index.js` 仍包含设备注册、持久认证、心跳、自动恢复和
+二维码链接生成逻辑。因此回归协议时以实际 AppImage 为准，公开源码用于核对周边的
+workspace、Host attachment 和远程运行架构。
+
+公开源码中的 `zcode-server-cli` 当前只在 loopback 上提供独立 Agent Server，供本机
+或 SSH 隧道连接；它没有启动中心 external relay，也不生成 `zcode.z.ai/remote/v4`
+链接，所以暂时不能取代本工具的 Electron + Xvfb 启动路径。
 
 ## 大版本更新后的回归清单
 
@@ -75,7 +93,12 @@ zcode update       更新最新版（官方 manifest，sha512 校验；--force �
 
 - **restore 静默跳过**：工作区不匹配时没有任何日志，症状是启动成功但
   v2 日志零 relay 记录 → 检查 `--open-workspace` 是否带上。
-- **extract-and-run 进程隐形**：真实 Electron 在 `/tmp/appimage_extracted_*/`，
+- **AppImage 临时目录跨用户冲突**：extract-and-run 默认在 `/tmp` 使用内容哈希命名
+  固定目录；同一版本若曾由 root 启动并残留 0700 目录，普通用户会报
+  `Failed to extract AppImage`。启动器强制使用 `~/.zcode/headless/tmp/` 避免冲突。
+- **就绪日志竞态**：必须在拉起应用前记录日志 offset，并同时接受
+  `waiting_terminal` 与 `paired`；否则应用快速就绪或手机快速配对时会无谓等待超时。
+- **extract-and-run 进程隐形**：真实 Electron 在 `$TMPDIR/appimage_extracted_*/`，
   cmdline 不含 AppImage 路径；进程匹配须含该模式，否则 stop 杀不净
   （Electron 成孤儿）、status 误报。stop 用进程组 killpg（仅组长）+ PPID 树扫。
 - **单实例锁会向存活实例转发 argv**（second-instance），可能歪打正着触发
