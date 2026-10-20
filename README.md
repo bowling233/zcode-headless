@@ -3,6 +3,10 @@
 在 headless 服务器上使用 ZCode（官方仅发 Electron GUI）。远控走官方 WebUI 中继
 `zcode.z.ai`，手机/浏览器打开链接即可操作服务器上的 ZCode。
 
+> **3.16.0 起远控协议切换为 Relay V2（账号绑定）**：注册改为带登录 JWT 的纯 HTTP
+> 调用，链接不再携带 `hash` 秘密参数，手机浏览器打开链接后需登录同一账号才能配对。
+> 本工具按 AppImage 版本自动选择 V2（≥3.16.0）/ V1（3.4.0~3.15.x）协议。
+
 ## 安装
 
 uv tool，从本仓库直接安装，无需 registry：
@@ -39,6 +43,31 @@ zcode update       更新最新版（官方 manifest，sha512 校验；--force �
 
 ## 原理要点
 
+### Relay V2（ZCode ≥ 3.16.0，当前）
+
+- 注册是账号绑定的纯 HTTP（无需 WebSocket 握手），JWT 取自登录凭据
+  `credentials.json:zcodejwttoken`，userId 取自
+  `oauth:{active_provider}:user_info` 的 `id`/`user_id`（与官方
+  `createTelemetryAuthorizationLoader` 同源）：
+  `POST {origin}/api/v1/remote/device {"device_mid":mid}`（Bearer JWT）→ `device_sid`。
+- 设备身份持久化在 `setting.json:webRemoteControlRelayV2Device`
+  = `{deviceSid, userId, endpointOrigin}`；应用核对 userId/endpointOrigin 一致
+  即复用该 SID，否则自动重注册并回写（应用侧 `AUTH_FAILED` 也会强制重注册自愈）。
+- 应用启动后自行 `POST /api/v1/remote/token {role:"device"}` 取一次性 token 连
+  `wss://{origin}/api/v1/remote/ws2` 完成 `auth_init`（meta 上报主机名/平台/版本），
+  本工具不参与数据面。
+- 链接只带路由提示，无秘密参数：
+  `{origin}/remote/v4?sid=…&mid=…&name=…&app_version=…`。
+  手机浏览器打开后必须**登录同一账号**（V2 按账号隔离设备）；带 `hash`/`t` 的
+  旧 V1 链接会被页面拒绝（invalid-mobile-connection）。
+- 就绪日志（主日志 `~/.zcode/v2/logs/YYYY-MM-DD.log`）：
+  `[web-remote-control] V2 device state {"state":"waiting_terminal"}`。
+- 3.16+ 应用首次启动远控时会主动清除 V1 的
+  `webRemoteControlExternalRelayDevice` 设置与 `pass_hash` 凭据；本工具注册 V2
+  时也会顺手清理这两个旧 key。
+
+### Relay V1（ZCode 3.4.0 ~ 3.15.x，保留兼容）
+
 - relay 客户端只在 Electron 主进程（app.asar `out/main/index.js`），CLI 引擎
   `zcode.cjs` 里没有，浏览器控制等也在 GUI → 跑完整 AppImage（Xvfb +
   `APPIMAGE_EXTRACT_AND_RUN=1 --no-sandbox --disable-gpu`）。
@@ -56,9 +85,10 @@ zcode update       更新最新版（官方 manifest，sha512 校验；--force �
   → `auth_init{role:"device"}` → `auth_challenge{nonce}` →
   `auth_response{proof=base64url(HMAC-SHA256(pass_hash,"nonce|device|sid"))}`
   → `auth_ack{pair_status:"waiting"}`。端点 `wss://zcode.z.ai/ws`。
-- relay 会回收无活跃连接的未配对设备 → 注册后不必保活；应用首连若
-  `AUTH_FAILED` 会 rotate 自愈（同一 pass_hash 重新注册、覆盖持久化），
-  实测确认有效。
+- relay 会回收无活跃连接的未配对设备 → 注册后不必保活。
+
+### 通用
+
 - 应用启动的 relay 自动恢复（`restorePreviouslyEnabled`）要求开机工作区与
   `webRemoteControlLastEnabledContext.workspacePath` 一致，否则静默跳过 →
   `start` 会带 `--open-workspace <path>`（应用原生参数）打开同一工作区。
@@ -69,10 +99,12 @@ zcode update       更新最新版（官方 manifest，sha512 校验；--force �
 
 ## 与开源版 ZCode 的关系
 
-ZCode 的公开源码没有包含 external relay 的完整实现，但发行版 AppImage 的
-`resources/app.asar/out/main/index.js` 仍包含设备注册、持久认证、心跳、自动恢复和
-二维码链接生成逻辑。因此回归协议时以实际 AppImage 为准，公开源码用于核对周边的
-workspace、Host attachment 和远程运行架构。
+ZCode 3.16.x 的公开源码已包含 Relay V2 完整实现
+（`packages/desktop/src/main/web-remote-relay/`、
+`packages/shared/src/web-remote-relay/` 与
+`docs/web-remote-control/relay-v2-pairing.md` 规范），本工具的 V2 注册/链接逻辑
+即对齐该源码。更早版本（3.14/3.15）的 external relay 实现未开源，回归协议时以
+实际 AppImage 的 `resources/app.asar/out/main/index.js` 为准。
 
 公开源码中的 `zcode-server-cli` 当前只在 loopback 上提供独立 Agent Server，供本机
 或 SSH 隧道连接；它没有启动中心 external relay，也不生成 `zcode.z.ai/remote/v4`
@@ -82,15 +114,21 @@ workspace、Host attachment 和远程运行架构。
 
 1. `zcode update`：版本比对、下载校验、替换；无已装版本时直接引导安装
    （desktop 文件由应用首启自建并维护，脚本不管）。
-2. `zcode stop && zcode`：启动 → `waiting_terminal` 日志 → 链接产出；手机打开可用。
+2. `zcode stop && zcode`：启动 → 就绪日志 → 链接产出；手机打开可用
+   （V2 需登录同一账号）。
 3. `zcode`（已运行时进程可见性、sid 一致性、链接产出）。
-4. 若失效，拆新版 AppImage 的 `resources/app.asar`（提取器见研究目录）重点核对：
-   链接构造 `buildWebRemoteControlExternalQrUrl`、注册握手消息、
-   `restorePreviouslyEnabled` 条件、manifest 端点、`enc:v1` 派生密钥、
-   setting/credentials 的 key 名。协议无文档，以 bundle 为准。
+4. 若失效，优先核对公开源码（`zai-org/ZCode`）的
+   `web-remote-relay` 模块与 `relay-v2-pairing.md`；未开源部分再拆 AppImage 的
+   `resources/app.asar` 核对：链接构造 `buildWebRemoteControlExternalQrUrl`、
+   注册握手消息、`restorePreviouslyEnabled` 条件、manifest 端点、`enc:v1` 派生
+   密钥、setting/credentials 的 key 名。
 
 ## 踩坑记录
 
+- **3.16.2 升级后拿不到链接（Relay V2 切换）**：旧版工具盯的 V1 就绪日志
+  `external relay device state` 不再出现（新格式 `V2 device state`），且 V1
+  `pass_hash` 被应用启动时清除、旧 `hash` 链接被页面拒绝 → 症状是启动后
+  等待超时、无链接。0.3.0 起按版本自动走 V2。
 - **restore 静默跳过**：工作区不匹配时没有任何日志，症状是启动成功但
   v2 日志零 relay 记录 → 检查 `--open-workspace` 是否带上。
 - **AppImage 临时目录跨用户冲突**：extract-and-run 默认在 `/tmp` 使用内容哈希命名
@@ -108,6 +146,8 @@ workspace、Host attachment 和远程运行架构。
   拿不准用绝对路径。
 - **v2 日志含 NUL**（多写者残留）：grep 要加 `-a`。
 - relay 日志在 `~/.zcode/v2/logs/YYYY-MM-DD.log`，就绪标记
-  `external relay device state {"state":"waiting_terminal"}`；
+  V2: `[web-remote-control] V2 device state {"state":"waiting_terminal"}`，
+  V1: `external relay device state {"state":"waiting_terminal"}`；
   启动器自身日志在 `~/.zcode/headless/app.log`。
-- `hash` 即配对凭据，链接勿外传；泄漏时 `zcode --rotate` 换绑。
+- V1 的 `hash` 即配对凭据，链接勿外传；泄漏时 `zcode --rotate` 换绑。
+  V2 链接无秘密，但 sid 关联账号设备列表，同样不宜外传。

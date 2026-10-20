@@ -14,23 +14,36 @@
 #       → 粘贴回调链接或 code → POST {ENDPOINT}/api/v1/oauth/token {provider:'bigmodel',code,…}
 #       → 换 token、派生 coding-plan key（getCustomerInfo → 默认机构/项目 → zcode-api-key copy）
 #       → enc:v1 加密写入 credentials.json / config.json / setting.json（merge, 不覆盖已有 key）
-#   - 远控中继客户端在 Electron 主进程里，随应用启动自动恢复上次开启的远控
-#     （setting.json: webRemoteControlLastEnabledContext），无需 GUI 点击。
-#   - 远控注册可替代"首次去 GUI 里点一下": 直连官方 relay (wss://…/ws) 完成设备
-#     注册握手并把凭据写成应用原生格式，应用下次启动即走原生恢复路径:
+#   - 远控协议按 AppImage 版本自动选择（3.16.0 起 ZCode 切换到账号绑定的 Relay V2）:
+#
+#   - Relay V2（App >= 3.16.0，对齐官方 web-remote-relay 模块）:
+#       注册是纯 HTTP，不需要 WebSocket 握手:
+#         JWT  = credentials.json zcodejwttoken（enc:v1 解密）
+#         uid  = oauth:{active_provider}:user_info 里的 id/user_id
+#         mid  = ~/.zcode/v2/telemetry-state.json deviceMid
+#         POST {origin}/api/v1/remote/device {"device_mid":mid}  Bearer JWT → device_sid
+#       身份写入 setting.json webRemoteControlRelayV2Device
+#         = {deviceSid, userId, endpointOrigin}（应用核对 userId/origin 一致即复用该 SID）
+#       应用启动时由 webRemoteControlLastEnabledContext.workspacePath 自动恢复远控，
+#       自行取一次性 token 连 wss {origin}/api/v1/remote/ws2 完成 auth_init（meta 上报主机名）。
+#       链接不再携带秘密参数，只有路由提示:
+#         {origin}/remote/v4?sid=…&mid=…&name=…&app_version=…
+#       手机浏览器打开后必须登录同一账号才能配对（V2 按账号隔离设备）。
+#       就绪日志（主日志 ~/.zcode/v2/logs/YYYY-MM-DD.log）:
+#         [web-remote-control] V2 device state {"state":"waiting_terminal"}
+#
+#   - Relay V1（App 3.4.0 ~ 3.15.x，旧设备级信任协议，保留兼容）:
+#       直连官方 relay (wss://…/ws) 完成设备注册握手并把凭据写成应用原生格式:
 #         C:{type:"device_register_init",device_mid,pass_hash,meta,client_ts}
 #         S:{type:"device_register_ack",device_sid}
 #         C:{type:"auth_init",role:"device",device_sid,meta,client_ts}
 #         S:{type:"auth_challenge",nonce}
-#         C:{type:"auth_response",device_sid,proof=base64url(HMAC-SHA256(pass_hash, "nonce|device|sid")),client_ts}
+#         C:{type:"auth_response",device_sid,proof=base64url(HMAC-SHA256(pass_hash,"nonce|device|sid"))}
 #         S:{type:"auth_ack",pair_status:"waiting"}     ← 注册完成，等待手机配对
-#     relay 是设备级信任（只认 pass_hash），全程不需要账号 token。
-#   - 链接参数全部持久化，可离线重建:
-#       sid   = ~/.zcode/v2/setting.json     webRemoteControlExternalRelayDevice.deviceSid
-#       hash  = ~/.zcode/v2/credentials.json web-remote-control:external-relay:pass_hash
-#               （enc:v1 AES-256-GCM，密钥 = sha256("zcode-credential-fallback:linux:$HOME:$USER")）
-#       mid   = ~/.zcode/v2/telemetry-state.json deviceMid
-#       name  = hostname；t = 当前时间戳；app_version = AppImage 版本
+#       链接 sid/hash/t/mid/name/app_version 全部持久化可离线重建:
+#         sid   = ~/.zcode/v2/setting.json     webRemoteControlExternalRelayDevice.deviceSid
+#         hash  = ~/.zcode/v2/credentials.json web-remote-control:external-relay:pass_hash
+#       （注意: 3.16.0+ 的应用首次启动远控时会主动清掉这两个 V1 key）
 #   - headless 下通过 Xvfb 运行完整 GUI（浏览器控制等 GUI 能力得以保留），
 #     APPIMAGE_EXTRACT_AND_RUN=1 免 FUSE，且更新可直接换文件。
 #   - 更新走官方 manifest: GET {endpoint}/api/v1/releases/electron/manifest
@@ -55,6 +68,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -97,6 +111,16 @@ RUNNING_RE = re.compile(
 READY_TIMEOUT = 240  # extract-and-run 冷启动解压较慢（200MB），慢盘上可达 2 分钟以上
 RELAY_READY_STATES = {"waiting_terminal", "paired"}
 WEB_REMOTE_V4_MIN_VERSION = (3, 4, 0)
+# Relay V2: 3.16.0 起桌面端切换到账号绑定的 HTTP 注册 + ws2 一次性 token 协议
+# （v3.15.1 仍是 pass_hash 设备级信任，见 git tag v3.15.1 webRemoteControlTransport.ts）。
+RELAY_V2_MIN_VERSION = (3, 16, 0)
+# setting.json 中的 V2 设备身份 key（官方 AppSettings.webRemoteControlRelayV2Device）
+V2_DEVICE_KEY = "webRemoteControlRelayV2Device"
+V1_DEVICE_KEY = "webRemoteControlExternalRelayDevice"
+V1_PASS_HASH_CRED = "web-remote-control:external-relay:pass_hash"
+# V1 日志: external relay device state {"state":"…"}
+# V2 日志: [web-remote-control] V2 device state {"state":"…"}
+RELAY_STATE_RE = re.compile(r'(?:external relay|V2) device state \{"state":"([a-z_]+)"\}')
 
 
 def log(msg, file=None):
@@ -208,19 +232,60 @@ def encrypt_enc_v1(plain, secret):
     return f"enc:v1:{_b64u(nonce)}.{_b64u(sealed[-16:])}.{_b64u(sealed[:-16])}"
 
 
-def decrypt_pass_hash():
-    """解密 credentials.json 中的远控 pass_hash（即链接里的 hash 参数）。"""
+def decrypt_credential(key):
+    """按 key 解密 credentials.json 中的一条 enc:v1 凭据；缺失/失败返回 None。"""
     try:
         creds = json.loads((V2_DIR / "credentials.json").read_text())
-    except FileNotFoundError:
-        return None, "未找到 ~/.zcode/v2/credentials.json（尚未登录）"
-    enc = creds.get("web-remote-control:external-relay:pass_hash")
+    except (OSError, ValueError):
+        return None
+    enc = creds.get(key)
     if not enc:
-        return None, "credentials.json 中无远控凭据（远控从未开启）"
+        return None
+    try:
+        return decrypt_enc_v1(enc, credential_secret())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def decrypt_pass_hash():
+    """解密 credentials.json 中的远控 pass_hash（V1 链接里的 hash 参数）。"""
+    enc = None
+    try:
+        creds = json.loads((V2_DIR / "credentials.json").read_text())
+        enc = creds.get(V1_PASS_HASH_CRED)
+    except (OSError, ValueError):
+        return None, "未找到 ~/.zcode/v2/credentials.json（尚未登录）"
+    if not enc:
+        return None, "credentials.json 中无 V1 远控凭据（3.16+ 应用已清理，或远控从未开启）"
     try:
         return decrypt_enc_v1(enc, credential_secret()), None
     except Exception as e:  # noqa: BLE001
         return None, f"解密失败: {e}"
+
+
+def encrypt_secret(plain):
+    """把明文按官方 enc:v1 格式加密（供写入 credentials.json）。"""
+    return encrypt_enc_v1(plain, credential_secret())
+
+
+# ---------- 版本/协议选择 ----------
+
+def is_v2_app(app_version):
+    """App >= 3.16.0 使用 Relay V2（账号绑定注册）。版本未知时按新协议处理。"""
+    m = re.match(r"\s*v?(\d+)\.(\d+)(?:\.(\d+))?", str(app_version or ""))
+    if not m:
+        return True
+    parts = tuple(int(m.group(i) or 0) for i in range(1, 4))
+    return parts >= RELAY_V2_MIN_VERSION
+
+
+def endpoint_origin():
+    """与官方 new URL(origin).origin 对齐：scheme://host[:port]，去掉路径与默认端口。"""
+    u = urllib.parse.urlsplit(ENDPOINT)
+    netloc = u.netloc
+    if (u.scheme == "https" and u.port == 443) or (u.scheme == "http" and u.port == 80):
+        netloc = u.hostname or netloc
+    return f"{u.scheme}://{netloc}"
 
 
 # ---------- 远控链接重建 ----------
@@ -239,7 +304,7 @@ def last_relay_state():
         text = (V2_DIR / "logs" / today).read_text(errors="replace")
     except OSError:
         return None
-    states = re.findall(r'external relay device state \{"state":"([a-z_]+)"\}', text)
+    states = RELAY_STATE_RE.findall(text)
     return states[-1] if states else None
 
 
@@ -257,8 +322,33 @@ def web_remote_path(app_version):
 
 def build_link(app_version=None, warn=True):
     """从持久化文件重建远控链接。返回 (url|None, problem|None)。"""
-    setting = read_json(V2_DIR / "setting.json")
-    sid = ((setting.get("webRemoteControlExternalRelayDevice") or {}).get("deviceSid") or "").strip()
+    if is_v2_app(app_version):
+        return build_link_v2(app_version)
+    return build_link_v1(app_version)
+
+
+def build_link_v2(app_version):
+    """V2 链接只带路由提示（sid/mid/name/app_version），无秘密参数；手机需登录同一账号。"""
+    dev = read_json(V2_DIR / "setting.json").get(V2_DEVICE_KEY) or {}
+    sid = str(dev.get("deviceSid") or "").strip()
+    if not sid:
+        return None, ("远控从未注册（setting.json 无 webRemoteControlRelayV2Device.deviceSid）"
+                      "——执行 `zcode` 引导注册（无需 GUI）")
+    mid = (read_json(V2_DIR / "telemetry-state.json").get("deviceMid") or "").strip()
+    qs = {"sid": sid}
+    if mid:
+        qs["mid"] = mid
+    name = socket.gethostname()
+    if name:
+        qs["name"] = name
+    if app_version:
+        qs["app_version"] = app_version
+    return f"{endpoint_origin()}/remote/v4?" + urllib.parse.urlencode(
+        qs, quote_via=urllib.parse.quote), None
+
+
+def build_link_v1(app_version):
+    sid = ((read_json(V2_DIR / "setting.json").get(V1_DEVICE_KEY) or {}).get("deviceSid") or "").strip()
     if not sid:
         return None, "远控从未开启（setting.json 无 deviceSid）——执行 `zcode --rotate` 注册（无需 GUI）"
     pass_hash, err = decrypt_pass_hash()
@@ -285,8 +375,9 @@ def print_link(app_version=None):
     if url:
         log(url)
         state = last_relay_state()
-        if state == "waiting_terminal":
-            log("  （relay 已连接，等待配对）")
+        if state in RELAY_READY_STATES:
+            log("  （relay 已连接，等待手机配对；手机需登录同一账号）"
+                if is_v2_app(app_version) else "  （relay 已连接，等待配对）")
         elif state:
             log(f"  （relay 状态: {state}）")
         else:
@@ -484,18 +575,7 @@ def ask_code(state):
 
 def logged_in():
     """credentials.json 里能解出 bigmodel access_token 即视为已登录。"""
-    try:
-        creds = json.loads((V2_DIR / "credentials.json").read_text())
-    except (OSError, ValueError):
-        return False
-    enc = creds.get("oauth:bigmodel:access_token")
-    if not enc:
-        return False
-    try:
-        decrypt_enc_v1(enc, credential_secret())
-        return True
-    except Exception:  # noqa: BLE001  secret 变化/密文损坏 → 需重新登录
-        return False
+    return bool(decrypt_credential("oauth:bigmodel:access_token"))
 
 
 def do_login():
@@ -549,7 +629,7 @@ def do_login():
     log("✓ 登录完成，凭据已写入 ~/.zcode/v2/")
 
 
-# ---------- relay WS 最小客户端（仅实现注册/认证握手所需子集） ----------
+# ---------- relay WS 最小客户端（V1 注册握手所需子集） ----------
 
 def relay_ws_url():
     u = urllib.parse.urlsplit(ENDPOINT)
@@ -692,12 +772,7 @@ def relay_exchange(first_msg, proof_key, meta, device_mid=None):
         ws.close()
 
 
-# ---------- enable: relay 设备注册（替代"首次 GUI 点击"） ----------
-
-def encrypt_secret(plain):
-    """把明文按官方 enc:v1 格式加密（供写入 credentials.json）。"""
-    return encrypt_enc_v1(plain, credential_secret())
-
+# ---------- enable: 远控设备注册（替代"首次 GUI 点击"） ----------
 
 def _merge_json(path, patch):
     data = read_json(path)
@@ -719,9 +794,85 @@ def _merge_json(path, patch):
             tmp.unlink(missing_ok=True)
 
 
-def relay_registered():
-    """deviceSid 存在且远控 pass_hash 可按当前官方 secret 解密才视为已注册。"""
-    sid = ((read_json(V2_DIR / "setting.json").get("webRemoteControlExternalRelayDevice") or {})
+def _remove_json_keys(path, keys):
+    data = read_json(path)
+    if not any(k in data for k in keys):
+        return
+    for k in keys:
+        data.pop(k, None)
+    _merge_json(path, {})
+
+
+def load_v2_login():
+    """与官方 createTelemetryAuthorizationLoader 对齐:
+    oauth:active_provider(限 zai/bigmodel) → user_info.id/user_id → zcodejwttoken。"""
+    provider = (decrypt_credential("oauth:active_provider") or "").strip()
+    if provider not in ("zai", "bigmodel"):
+        return None, "无有效登录（oauth:active_provider 缺失或非 zai/bigmodel）"
+    user_id = ""
+    info_raw = decrypt_credential(f"oauth:{provider}:user_info")
+    if info_raw:
+        try:
+            info = json.loads(info_raw)
+            user_id = str(info.get("id") or info.get("user_id") or "").strip()
+        except ValueError:
+            pass
+    jwt = (decrypt_credential("zcodejwttoken") or "").strip()
+    if not jwt or not user_id:
+        return None, "zcodejwttoken 或 user_info.id 缺失/损坏——执行 `zcode --relogin` 重新登录"
+    if not re.fullmatch(r"[\x21-\x7e]+", jwt):
+        return None, "zcodejwttoken 含不可见字符，凭据可疑——执行 `zcode --relogin`"
+    return (jwt, user_id), None
+
+
+def v2_post(path, body, jwt):
+    """官方 Relay V2 HTTP 契约: {code:0,msg,data}，401 表示 JWT 失效。"""
+    try:
+        return post_json(f"{endpoint_origin()}{path}", body,
+                         headers={"Authorization": f"Bearer {jwt}"})
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die("relay 返回 401: 登录凭据无效或已过期——执行 `zcode --relogin` 重新登录")
+        try:  # 非 2xx 也可能带 JSON 业务错误信封（如 400 parameter error）
+            j = json.loads(e.read())
+            c = j.get("code")
+        except Exception:  # noqa: BLE001
+            c = None
+        if c not in (None, 0, 200):
+            die(f"relay V2 请求失败: HTTP {e.code} code={c} {j.get('msg') or j.get('message')}")
+        raise
+
+
+def v2_register_device(jwt, device_mid):
+    j = v2_post("/api/v1/remote/device", {"device_mid": device_mid}, jwt)
+    c = j.get("code")
+    if c not in (None, 0, 200):
+        die(f"relay V2 注册失败: {j.get('msg') or j.get('message')}")
+    sid = str(((j.get("data") or {}).get("device_sid")) or "").strip()
+    if not sid:
+        die(f"relay V2 注册响应缺少 device_sid: {j}")
+    return sid
+
+
+def v2_delete_device(jwt, device_sid):
+    """尽力删除旧设备记录（仅本人离线设备可删）；失败仅告警，不阻塞重新注册。"""
+    j = v2_post("/api/v1/remote/device/delete", {"device_sid": device_sid}, jwt)
+    c = j.get("code")
+    if c not in (None, 0, 200):
+        log(f"  旧设备删除被拒（code={c} {j.get('msg')}，忽略）")
+
+
+def stored_device_sid():
+    dev = read_json(V2_DIR / "setting.json").get(V2_DEVICE_KEY) or {}
+    sid = str(dev.get("deviceSid") or "").strip()
+    return sid or None
+
+
+def relay_registered(app_version=None):
+    """远控是否已注册（按 App 版本选择判定方式）。"""
+    if is_v2_app(app_version):
+        return stored_device_sid() is not None
+    sid = ((read_json(V2_DIR / "setting.json").get(V1_DEVICE_KEY) or {})
            .get("deviceSid") or "").strip()
     if not sid:
         return False
@@ -729,17 +880,66 @@ def relay_registered():
     return bool(pass_hash)
 
 
-def do_enable():
-    V2_DIR.mkdir(parents=True, exist_ok=True)
-    appimage = find_appimage()
-    app_ver = app_version_from_path(appimage) if appimage else None
-    password = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
-    pass_hash = base64.b64encode(hashlib.sha256(password.encode()).digest()).decode()
+def _ensure_device_mid():
+    """确保 telemetry-state.json 有 deviceMid（与官方 ensureDesktopDeviceMidSync 同源）。"""
     tele_path = V2_DIR / "telemetry-state.json"
     tele = read_json(tele_path)
     device_mid = tele.get("deviceMid") or str(uuid.uuid4())
     if tele.get("deviceMid") != device_mid:
         _merge_json(tele_path, {"deviceMid": device_mid})
+    return device_mid
+
+
+def do_enable(app_version=None):
+    if is_v2_app(app_version):
+        do_enable_v2()
+    else:
+        do_enable_v1()
+
+
+def do_enable_v2():
+    """Relay V2 注册: 纯 HTTP，账号 JWT 绑定；身份写入 setting.json 供应用复用。"""
+    V2_DIR.mkdir(parents=True, exist_ok=True)
+    login, err = load_v2_login()
+    if not login:
+        die(f"Relay V2 注册需要登录态: {err}")
+    jwt, user_id = login
+    device_mid = _ensure_device_mid()
+
+    old_sid = stored_device_sid()
+    if old_sid:
+        # --rotate 或身份失效重注册：旧 SID 只有离线才可删（调用前应用已被停止）
+        log(f"删除旧设备记录 {old_sid[:8]}…（仅离线设备可删，失败不影响）")
+        try:
+            v2_delete_device(jwt, old_sid)
+        except OSError as e:
+            log(f"  旧设备删除失败（忽略）: {e}")
+
+    log("连接官方 relay 注册设备（Relay V2，账号绑定）…")
+    try:
+        sid = v2_register_device(jwt, device_mid)
+    except OSError as e:
+        die(f"无法连接 relay ({endpoint_origin()}): {e}")
+    _merge_json(V2_DIR / "setting.json", {
+        V2_DEVICE_KEY: {"deviceSid": sid, "userId": user_id,
+                        "endpointOrigin": endpoint_origin()},
+        # V1 残留清理（3.16+ 应用首次启动远控时也会自清，提前清掉避免旧工具误判）
+        V1_DEVICE_KEY: None,
+        "webRemoteControlLastEnabledContext": {"workspacePath": os.getcwd()},
+    })
+    _remove_json_keys(V2_DIR / "credentials.json", [V1_PASS_HASH_CRED])
+    os.chmod(V2_DIR / "setting.json", 0o600)
+    log(f"✓ 远控已注册（Relay V2, sid={sid[:8]}…），身份已写入 setting.json"
+        f"（workspace: {os.getcwd()}）")
+
+
+def do_enable_v1():
+    V2_DIR.mkdir(parents=True, exist_ok=True)
+    appimage = find_appimage()
+    app_ver = app_version_from_path(appimage) if appimage else None
+    password = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+    pass_hash = base64.b64encode(hashlib.sha256(password.encode()).digest()).decode()
+    device_mid = _ensure_device_mid()
     meta = {"platform": "linux", "version": app_ver or "", "name": socket.gethostname()}
 
     log("连接官方 relay 注册设备 …")
@@ -757,13 +957,13 @@ def do_enable():
 
     setting_path = V2_DIR / "setting.json"
     _merge_json(setting_path, {
-        "webRemoteControlExternalRelayDevice": {"deviceSid": sid},
+        V1_DEVICE_KEY: {"deviceSid": sid},
         "webRemoteControlLastEnabledContext": {"workspacePath": os.getcwd()},
     })
     creds_path = V2_DIR / "credentials.json"
     # 官方客户端持久化的是 createPassHash(password) 的结果，而不是 password。
     # 保存 preimage 会迫使应用首次连接走 AUTH_FAILED -> 清理 -> 重注册的自愈路径。
-    _merge_json(creds_path, {"web-remote-control:external-relay:pass_hash": encrypt_secret(pass_hash)})
+    _merge_json(creds_path, {V1_PASS_HASH_CRED: encrypt_secret(pass_hash)})
     for p in (setting_path, creds_path):
         os.chmod(p, 0o600)
     log(f"✓ 远控已注册，凭据已写入 setting.json / credentials.json（workspace: {os.getcwd()}）")
@@ -810,7 +1010,11 @@ def relay_log_checkpoint():
 
 
 def wait_relay_ready(proc, checkpoint=None, deadline=None):
-    """等待官方日志出现 relay waiting_terminal/paired，并及时识别子进程退出。"""
+    """等待官方日志出现 relay waiting_terminal/paired，并及时识别子进程退出。
+
+    V1 日志: external relay device state {"state":"…"}
+    V2 日志: [web-remote-control] V2 device state {"state":"…"}
+    """
     deadline = deadline or time.time() + READY_TIMEOUT
     today = lambda: V2_DIR / "logs" / time.strftime("%Y-%m-%d.log", time.localtime())
     seen_sizes = dict(checkpoint or relay_log_checkpoint())
@@ -828,7 +1032,7 @@ def wait_relay_ready(proc, checkpoint=None, deadline=None):
                     fp.seek(seen_size)
                     new_text = fp.read()
                 seen_sizes[f] = size
-                states = re.findall(r'external relay device state \{"state":"([a-z_]+)"\}', new_text)
+                states = RELAY_STATE_RE.findall(new_text)
                 if states and states[-1] in RELAY_READY_STATES:
                     return states[-1]
                 if "[web-remote-control] restore previous enabled state failed" in new_text:
@@ -845,7 +1049,7 @@ def do_start(rotate=False, relogin=False):
         log(f"ZCode 正在运行；为执行{requested}先停止当前实例 …")
         do_stop(quiet=True)
         running = []
-    if running and not relay_registered():
+    if running and not relay_registered(app_version_from_running(running)):
         log("ZCode 正在运行，但远控凭据缺失或无法解密；停止实例后重新注册 …")
         do_stop(quiet=True)
         running = []
@@ -855,22 +1059,23 @@ def do_start(rotate=False, relogin=False):
         log(f"ZCode 已在运行 (pid {pid}, v{ver or '?'})")
         print_link(ver)
         return
-    # 1) 登录态（BigModel OAuth）
+    # 1) 登录态（BigModel OAuth；V2 注册也依赖该 JWT）
     if relogin or not logged_in():
         if relogin:
             log("执行重新登录 …")
         do_login()
-    # 2) 远控设备注册
-    if rotate or not relay_registered():
-        if rotate:
-            log("执行远控重新注册（--rotate）…")
-        do_enable()
-    # 3) 启动应用
+    # 2) 应用与版本（决定 Relay V1/V2 协议）
     appimage = find_appimage()
     if not appimage:
         die(f"未找到 AppImage（期望 {APPS_DIR}/ZCode-*-{release_platform()}.AppImage；"
             f"可先执行 `zcode update` 从官方 manifest 安装）")
     ver = app_version_from_path(appimage)
+    # 3) 远控设备注册
+    if rotate or not relay_registered(ver):
+        if rotate:
+            log("执行远控重新注册（--rotate）…")
+        do_enable(ver)
+    # 4) 启动应用
     # 以当前目录为远控工作区（WebUI 无法新建工作区，靠启动参数指定）；
     # relay restore 要求开机工作区与远控 context 一致，故先回写 setting.json 再 --open-workspace
     app_args = ["--no-sandbox", "--disable-gpu"]
@@ -896,6 +1101,7 @@ def do_start(rotate=False, relogin=False):
         log("⚠ ZCode 已启动，但官方日志报告 relay 自动恢复失败；可执行 `zcode --rotate` 重试。")
     else:
         log(f"⚠ 已启动，但 {READY_TIMEOUT}s 内未确认 relay 连接（最近状态: {state}）。")
+    # V2 下应用可能因身份不匹配自动重注册（启动中已回写 setting.json），此处重建链接取最终 sid
     print_link(ver)
 
 
