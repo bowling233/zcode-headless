@@ -329,8 +329,7 @@ def build_link(app_version=None, warn=True):
 
 def build_link_v2(app_version):
     """V2 链接只带路由提示（sid/mid/name/app_version），无秘密参数；手机需登录同一账号。"""
-    dev = read_json(V2_DIR / "setting.json").get(V2_DEVICE_KEY) or {}
-    sid = str(dev.get("deviceSid") or "").strip()
+    sid = stored_device_sid() or str(read_json(STATE_FILE).get("v2_sid") or "").strip()
     if not sid:
         return None, ("远控从未注册（setting.json 无 webRemoteControlRelayV2Device.deviceSid）"
                       "——执行 `zcode` 引导注册（无需 GUI）")
@@ -774,9 +773,7 @@ def relay_exchange(first_msg, proof_key, meta, device_mid=None):
 
 # ---------- enable: 远控设备注册（替代"首次 GUI 点击"） ----------
 
-def _merge_json(path, patch):
-    data = read_json(path)
-    data.update(patch)
+def _write_json_atomic(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = None
     try:
@@ -794,13 +791,21 @@ def _merge_json(path, patch):
             tmp.unlink(missing_ok=True)
 
 
+def _merge_json(path, patch):
+    data = read_json(path)
+    data.update(patch)
+    _write_json_atomic(path, data)
+
+
 def _remove_json_keys(path, keys):
+    """整键移除（原子写）。setting.json 的 zod schema 对 key 只接受缺省，
+    写 null 会让整个文件校验失败、应用回退默认设置。"""
     data = read_json(path)
     if not any(k in data for k in keys):
         return
     for k in keys:
         data.pop(k, None)
-    _merge_json(path, {})
+    _write_json_atomic(path, data)
 
 
 def load_v2_login():
@@ -923,12 +928,16 @@ def do_enable_v2():
     _merge_json(V2_DIR / "setting.json", {
         V2_DEVICE_KEY: {"deviceSid": sid, "userId": user_id,
                         "endpointOrigin": endpoint_origin()},
-        # V1 残留清理（3.16+ 应用首次启动远控时也会自清，提前清掉避免旧工具误判）
-        V1_DEVICE_KEY: None,
         "webRemoteControlLastEnabledContext": {"workspacePath": os.getcwd()},
     })
+    # V1 残留必须整键移除（应用首启远控也会自清）：zod schema 对该 key 只接受缺省，
+    # 写 null 会让整个 setting.json 校验失败 → 应用回退默认设置 → 远控恢复静默失效。
+    _remove_json_keys(V2_DIR / "setting.json", [V1_DEVICE_KEY])
     _remove_json_keys(V2_DIR / "credentials.json", [V1_PASS_HASH_CRED])
     os.chmod(V2_DIR / "setting.json", 0o600)
+    # 备份 sid 到控制状态文件：setting.json 极端丢失时的链接兜底
+    CTL_DIR.mkdir(parents=True, exist_ok=True)
+    _merge_json(STATE_FILE, {"v2_sid": sid, "v2_sid_at": time.time()})
     log(f"✓ 远控已注册（Relay V2, sid={sid[:8]}…），身份已写入 setting.json"
         f"（workspace: {os.getcwd()}）")
 
@@ -1014,10 +1023,13 @@ def wait_relay_ready(proc, checkpoint=None, deadline=None):
 
     V1 日志: external relay device state {"state":"…"}
     V2 日志: [web-remote-control] V2 device state {"state":"…"}
+    超时只报告 checkpoint 之后新出现的状态：上一个实例遗留的 waiting_terminal
+    不代表本次启动已连接。
     """
     deadline = deadline or time.time() + READY_TIMEOUT
     today = lambda: V2_DIR / "logs" / time.strftime("%Y-%m-%d.log", time.localtime())
     seen_sizes = dict(checkpoint or relay_log_checkpoint())
+    last_state = None
     while time.time() < deadline:
         if proc.poll() is not None:
             return "process-exited"
@@ -1033,12 +1045,14 @@ def wait_relay_ready(proc, checkpoint=None, deadline=None):
                     new_text = fp.read()
                 seen_sizes[f] = size
                 states = RELAY_STATE_RE.findall(new_text)
-                if states and states[-1] in RELAY_READY_STATES:
-                    return states[-1]
+                if states:
+                    last_state = states[-1]
+                    if last_state in RELAY_READY_STATES:
+                        return last_state
                 if "[web-remote-control] restore previous enabled state failed" in new_text:
                     return "relay-error"
         time.sleep(1)
-    return last_relay_state() or "timeout"
+    return last_state or "timeout"
 
 
 def do_start(rotate=False, relogin=False):

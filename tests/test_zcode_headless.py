@@ -222,9 +222,17 @@ class ZCodeHeadlessTests(unittest.TestCase):
 
     def test_enable_v2_registers_via_http_and_persists_identity(self):
         with tempfile.TemporaryDirectory() as td:
-            v2_dir = Path(td) / "v2"
+            root = Path(td)
+            v2_dir = root / "v2"
+            ctl_dir = root / "ctl"
+            v2_dir.mkdir(parents=True)
+            (v2_dir / "setting.json").write_text(
+                json.dumps({z.V1_DEVICE_KEY: {"deviceSid": "sid_v1_old"}})
+            )
             with (
                 mock.patch.object(z, "V2_DIR", v2_dir),
+                mock.patch.object(z, "CTL_DIR", ctl_dir),
+                mock.patch.object(z, "STATE_FILE", ctl_dir / "state.json"),
                 mock.patch.object(z, "log"),
                 mock.patch.object(
                     z, "load_v2_login", return_value=(("jwt_test", "uid_test"), None)
@@ -236,10 +244,11 @@ class ZCodeHeadlessTests(unittest.TestCase):
             ):
                 z.do_enable("3.16.2")
                 setting = json.loads((v2_dir / "setting.json").read_text())
+                state = json.loads((ctl_dir / "state.json").read_text())
             register.assert_called_once()  # (jwt, device_mid)
             self.assertEqual(register.call_args.args[0], "jwt_test")
             self.assertEqual(len(register.call_args.args), 2)
-            delete.assert_not_called()  # 无旧身份时不触发删除
+            delete.assert_not_called()  # 无旧 V2 身份时不触发删除
             self.assertEqual(
                 setting[z.V2_DEVICE_KEY],
                 {
@@ -251,12 +260,15 @@ class ZCodeHeadlessTests(unittest.TestCase):
             self.assertEqual(
                 setting["webRemoteControlLastEnabledContext"], {"workspacePath": z.os.getcwd()}
             )
-            # V1 残留被清理（写 null 与官方 patchSettings(undefined) 等价）
-            self.assertIsNone(setting.get(z.V1_DEVICE_KEY))
+            # V1 残留必须整键移除：zod 对该 key 只接受缺省，null 会让应用
+            # 整文件校验失败回退默认设置（远控恢复静默失效）
+            self.assertNotIn(z.V1_DEVICE_KEY, setting)
+            self.assertEqual(state["v2_sid"], "sid_new")  # 链接兜底备份
 
     def test_enable_v2_rotates_old_sid(self):
         with tempfile.TemporaryDirectory() as td:
-            v2_dir = Path(td) / "v2"
+            root = Path(td)
+            v2_dir = root / "v2"
             v2_dir.mkdir(parents=True)
             (v2_dir / "setting.json").write_text(
                 json.dumps({z.V2_DEVICE_KEY: {"deviceSid": "sid_old",
@@ -265,6 +277,8 @@ class ZCodeHeadlessTests(unittest.TestCase):
             )
             with (
                 mock.patch.object(z, "V2_DIR", v2_dir),
+                mock.patch.object(z, "CTL_DIR", root / "ctl"),
+                mock.patch.object(z, "STATE_FILE", root / "ctl" / "state.json"),
                 mock.patch.object(z, "log"),
                 mock.patch.object(
                     z, "load_v2_login", return_value=(("jwt_test", "uid_test"), None)
@@ -274,6 +288,40 @@ class ZCodeHeadlessTests(unittest.TestCase):
             ):
                 z.do_enable("3.16.2")
             delete.assert_called_once_with("jwt_test", "sid_old")
+
+    def test_wait_relay_ready_ignores_stale_state_before_checkpoint(self):
+        # 上一个实例遗留的 waiting_terminal 不能让本次启动误报就绪
+        with tempfile.TemporaryDirectory() as td:
+            v2_dir = Path(td)
+            log_dir = v2_dir / "logs"
+            log_dir.mkdir()
+            log_path = log_dir / time.strftime("%Y-%m-%d.log", time.localtime())
+            log_path.write_text(
+                'external relay device state {"state":"waiting_terminal"}\n'
+            )
+            with mock.patch.object(z, "V2_DIR", v2_dir):
+                checkpoint = z.relay_log_checkpoint()
+                state = z.wait_relay_ready(
+                    FakeProcess(), checkpoint, deadline=time.time() + 1.5
+                )
+            self.assertEqual(state, "timeout")
+
+    def test_build_link_v2_falls_back_to_state_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "v2" / "telemetry-state.json").parent.mkdir(parents=True)
+            (root / "v2" / "telemetry-state.json").write_text("{}")
+            with (
+                mock.patch.object(z, "V2_DIR", root / "v2"),
+                mock.patch.object(z, "STATE_FILE", root / "ctl" / "state.json"),
+            ):
+                url, problem = z.build_link("3.16.2")
+                self.assertIsNone(url)
+                self.assertIn("远控从未注册", problem)
+                z._merge_json(root / "ctl" / "state.json", {"v2_sid": "sid_backup"})
+                url, problem = z.build_link("3.16.2")
+            self.assertIsNone(problem)
+            self.assertIn("sid=sid_backup", url)
 
     def test_relay_registered_selects_protocol_by_version(self):
         with tempfile.TemporaryDirectory() as td:

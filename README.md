@@ -125,6 +125,12 @@ ZCode 3.16.x 的公开源码已包含 Relay V2 完整实现
 
 ## 踩坑记录
 
+- **setting.json 不得写 null 清 key**：应用用 zod 校验整个文件，`optional` 只接受
+  key 缺省，`null` 会让校验失败 → 应用回退默认设置 → 远控恢复静默失效、身份
+  被后续写盘冲掉。清理旧 key 必须整键移除（`_remove_json_keys`）。
+- **就绪等待不能回看旧状态**：等待超时时兜底读"今天日志最后一条状态"会把上
+  一个实例遗留的 `waiting_terminal` 误报成本次就绪；只统计本次启动 checkpoint
+  之后新写出的状态行。
 - **3.16.2 升级后拿不到链接（Relay V2 切换）**：旧版工具盯的 V1 就绪日志
   `external relay device state` 不再出现（新格式 `V2 device state`），且 V1
   `pass_hash` 被应用启动时清除、旧 `hash` 链接被页面拒绝 → 症状是启动后
