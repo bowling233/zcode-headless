@@ -985,7 +985,14 @@ def start_app(appimage, app_args):
     os.chmod(APPIMAGE_TMP_DIR, 0o700)
     xvfb_run = shutil.which("xvfb-run")
     if xvfb_run and not os.environ.get("ZCODE_USE_SESSION_DISPLAY"):
-        prefix = [xvfb_run, "-a", "--server-args=-screen 0 1440x900x24 -nolisten tcp"]
+        # `-a` only looks for /tmp/.X<N>-lock files.  Other Xvfb launchers
+        # (notably Flatpak applications) can occupy a display without leaving
+        # that lock behind, so `-a` may select an already-running display and
+        # pair it with a different Xauthority cookie.  Electron then fails
+        # with "Invalid MIT-MAGIC-COOKIE-1" / "Missing X server".  `-d` asks
+        # Xvfb itself for a free display via -displayfd and works with both
+        # ordinary and externally-managed X servers.
+        prefix = [xvfb_run, "-d", "--server-args=-screen 0 1440x900x24 -nolisten tcp"]
         display_desc = "Xvfb"
     elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         prefix = []
