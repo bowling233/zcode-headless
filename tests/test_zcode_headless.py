@@ -20,6 +20,28 @@ class FakeProcess:
 
 
 class ZCodeHeadlessTests(unittest.TestCase):
+    def test_xvfb_display_option_detects_wrapper_support(self):
+        for help_text, expected in [
+            ("Options:\n-d        --auto-display  use the X server\n", "-d"),
+            ("Options:\n-a        --auto-servernum  find a free server\n", "-a"),
+            ("-s ARGS   --server-args=ARGS\n", "-a"),
+        ]:
+            for stream in ("stdout", "stderr"):
+                with self.subTest(help_text=help_text, stream=stream):
+                    result = mock.Mock(returncode=0, stdout="", stderr="")
+                    setattr(result, stream, help_text)
+                    with mock.patch.object(z.subprocess, "run", return_value=result):
+                        self.assertEqual(z.xvfb_display_option("/bin/xvfb-run"), expected)
+
+    def test_xvfb_display_option_falls_back_when_probe_fails(self):
+        for failure in (OSError("unavailable"), z.subprocess.TimeoutExpired("xvfb-run", 5)):
+            with self.subTest(failure=failure):
+                with mock.patch.object(z.subprocess, "run", side_effect=failure):
+                    self.assertEqual(z.xvfb_display_option("/bin/xvfb-run"), "-a")
+        with mock.patch.object(z.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout="-d --auto-display", stderr="")):
+            self.assertEqual(z.xvfb_display_option("/bin/xvfb-run"), "-a")
+
     def test_appimage_names_support_x64_and_arm64(self):
         self.assertEqual(
             z.app_version_from_path("ZCode-3.14.3-linux-x64.AppImage"), "3.14.3"

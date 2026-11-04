@@ -20,6 +20,8 @@ uv tool install git+ssh://git@github.com/bowling233/zcode-headless.git
 
 依赖 `uv`（工具环境自动隔离安装 cryptography/pyyaml）；headless 显示依赖 Xvfb
 （Debian: `apt install xvfb`，Fedora: `dnf install xorg-x11-server-Xvfb`）。
+`xvfb-run` 支持 `-d` 时优先让 Xvfb 分配显示编号，以避免显示编号冲突；
+不支持该参数的版本（如 Debian 13）自动回退到 `-a`。
 AppImage 解压目录固定隔离在 `~/.zcode/headless/tmp/`，不会与其他用户或 root 在
 `/tmp/appimage_extracted_*` 下的同名目录冲突。
 

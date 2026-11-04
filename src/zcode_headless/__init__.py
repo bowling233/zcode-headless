@@ -978,6 +978,21 @@ def do_enable_v1():
     log(f"✓ 远控已注册，凭据已写入 setting.json / credentials.json（workspace: {os.getcwd()}）")
 
 
+def xvfb_display_option(xvfb_run):
+    """Prefer displayfd when the wrapper supports it; older wrappers need -a."""
+    try:
+        result = subprocess.run(
+            [xvfb_run, "--help"], capture_output=True, text=True,
+            errors="replace", timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "-a"
+    if result.returncode == 0 and re.search(
+            r"^\s*-d(?:\s|,|$)", result.stdout + "\n" + result.stderr,
+            re.MULTILINE):
+        return "-d"
+    return "-a"
+
+
 def start_app(appimage, app_args):
     """后台启动 ZCode。返回 (Popen, display_desc, relay 日志启动位置)。"""
     CTL_DIR.mkdir(parents=True, exist_ok=True)
@@ -991,8 +1006,11 @@ def start_app(appimage, app_args):
         # pair it with a different Xauthority cookie.  Electron then fails
         # with "Invalid MIT-MAGIC-COOKIE-1" / "Missing X server".  `-d` asks
         # Xvfb itself for a free display via -displayfd and works with both
-        # ordinary and externally-managed X servers.
-        prefix = [xvfb_run, "-d", "--server-args=-screen 0 1440x900x24 -nolisten tcp"]
+        # ordinary and externally-managed X servers. Older xvfb-run wrappers
+        # do not expose -d even when Xvfb supports -displayfd; fall back to
+        # their supported -a option rather than failing before app startup.
+        prefix = [xvfb_run, xvfb_display_option(xvfb_run),
+                  "--server-args=-screen 0 1440x900x24 -nolisten tcp"]
         display_desc = "Xvfb"
     elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         prefix = []
