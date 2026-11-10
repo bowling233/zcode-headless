@@ -418,6 +418,63 @@ class ZCodeHeadlessTests(unittest.TestCase):
             self.assertEqual(query["hash"], ["hash_test"])
             self.assertEqual(query["mid"], ["mid_test"])
 
+    def _logged_in_with(self, entries):
+        with tempfile.TemporaryDirectory() as td:
+            v2_dir = Path(td)
+            with (
+                mock.patch.dict(z.os.environ, {"ZCODE_CREDENTIAL_SECRET": "test-secret"}),
+                mock.patch.object(z, "V2_DIR", v2_dir),
+            ):
+                creds = {k: z.encrypt_secret(v) for k, v in entries.items()}
+                (v2_dir / "credentials.json").write_text(json.dumps(creds))
+                return z.logged_in()
+
+    def test_logged_in_accepts_bigmodel_session(self):
+        self.assertTrue(self._logged_in_with({
+            "oauth:active_provider": "bigmodel",
+            "oauth:bigmodel:access_token": "tok",
+        }))
+        # legacy credentials without active_provider
+        self.assertTrue(self._logged_in_with({"oauth:bigmodel:access_token": "tok"}))
+
+    def test_logged_in_accepts_zai_session(self):
+        self.assertTrue(self._logged_in_with({
+            "oauth:active_provider": "zai",
+            "oauth:zai:access_token": "tok",
+        }))
+
+    def test_logged_in_false_without_tokens(self):
+        self.assertFalse(self._logged_in_with({"oauth:active_provider": "zai"}))
+        self.assertFalse(self._logged_in_with({}))
+
+    def test_start_with_zai_session_does_not_trigger_login(self):
+        with tempfile.TemporaryDirectory() as td:
+            v2_dir = Path(td)
+            with (
+                mock.patch.dict(z.os.environ, {"ZCODE_CREDENTIAL_SECRET": "test-secret"}),
+                mock.patch.object(z, "V2_DIR", v2_dir),
+                mock.patch.object(z, "find_running", return_value=[]),
+                mock.patch.object(z, "do_login") as login,
+                mock.patch.object(z, "do_enable"),
+                mock.patch.object(z, "relay_registered", return_value=True),
+                mock.patch.object(
+                    z, "find_appimage", return_value=Path("/apps/ZCode-3.14.3-linux-x64.AppImage")
+                ),
+                mock.patch.object(
+                    z, "start_app", return_value=(mock.Mock(pid=123), "Xvfb", {})
+                ),
+                mock.patch.object(z, "wait_relay_ready", return_value="waiting_terminal"),
+                mock.patch.object(z, "print_link"),
+                mock.patch.object(z, "log"),
+            ):
+                creds = {
+                    "oauth:active_provider": z.encrypt_secret("zai"),
+                    "oauth:zai:access_token": z.encrypt_secret("tok"),
+                }
+                (v2_dir / "credentials.json").write_text(json.dumps(creds))
+                z.do_start()
+            login.assert_not_called()
+
     def test_merge_json_is_atomic_and_private(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "credentials.json"

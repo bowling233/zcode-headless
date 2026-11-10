@@ -573,8 +573,17 @@ def ask_code(state):
 
 
 def logged_in():
-    """credentials.json 里能解出 bigmodel access_token 即视为已登录。"""
-    return bool(decrypt_credential("oauth:bigmodel:access_token"))
+    """credentials.json 里能解出活动 provider（zai/bigmodel）的 access_token 即视为已登录。
+
+    ZCode 可直接用 z.ai 账号登录（oauth:active_provider=zai，无 bigmodel token），
+    此时不应再触发交互式 BigModel 登录。active_provider 缺失/无法解密时回退到
+    旧行为（bigmodel），再尝试 zai。"""
+    providers = []
+    active = (decrypt_credential("oauth:active_provider") or "").strip()
+    for p in (active, "bigmodel", "zai"):
+        if p in ("zai", "bigmodel") and p not in providers:
+            providers.append(p)
+    return any(decrypt_credential(f"oauth:{p}:access_token") for p in providers)
 
 
 def do_login():
